@@ -408,7 +408,7 @@ class DataDistKVManager(CommonKVManager):
                 # 全部发送完成，同步状态到decoder
                 self.update_status(bootstrap_room, KVPoll.Success)
                 for req in reqs_to_be_processed:
-                    if req.is_dummy()
+                    if req.is_dummy():
                         continue
                     self.sync_status_to_decode(
                         req.endpoint,
