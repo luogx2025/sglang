@@ -160,6 +160,10 @@ TORCH_DTYPE_TO_NPU_DTYPE = {
 
 
 class DataDistKVManager(CommonKVManager):
+    _socket_cache = {}
+    _socket_lock = {}
+    _global_lock = threading.Lock()
+    _ctx = zmq.Context()
     def __init__(
         self,
         args: KVArgs,
@@ -325,18 +329,29 @@ class DataDistKVManager(CommonKVManager):
 
         threading.Thread(target=bootstrap_thread).start()
 
+    def _connect(self, endpoint: str):
+        with self._global_lock:
+            if endpoint not in self._socket_cache:
+                sock = self._ctx.socket(zmq.PUSH)
+                sock.connect(endpoint)
+                self._socket_cache[endpoint] = sock
+                self._socket_lock[endpoint] = threading.Lock()
+            return self._socket_cache[endpoint], self._socket_lock[endpoint]
+
     def sync_status_to_decode(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         if ":" in remote:
             remote = remote.split(":")[0]
-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ]
-        )
+        sock, lock = self._connect(f"tcp://{remote}:{dst_port}")
+        with lock:
+            sock.send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ]
+            )
 
     def start_decode_thread(self):
         self.server_socket.bind(f"tcp://{self.local_host_ip}:{self.rank_port}")
