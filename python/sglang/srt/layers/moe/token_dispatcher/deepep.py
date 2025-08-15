@@ -870,7 +870,7 @@ class NpuDeepEPDispatcher:
             expert_tokens,
             ep_recv_counts,
             tp_recv_counts,
-        ) = torch_npu.npu_moe_distribute_dispatch(**_kwargs)[:6]
+        ) = torch_npu.npu_moe_distribute_dispatch_v2(**_kwargs)[:6]
         return (
             hidden_states,
             dynamic_scale,
@@ -965,7 +965,7 @@ class NpuDeepEPDispatcher:
         _kwargs = {
             "expand_x": hidden_states,
             "expert_ids": topk_ids.to(torch.int),
-            "expand_idx": topk_idx,
+            "assist_info_for_combine": topk_idx,
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_x": shared_output,
@@ -980,5 +980,5 @@ class NpuDeepEPDispatcher:
             "group_tp": self.group_name,
             "tp_world_size": self.experts_tp_size,
         }
-        hidden_states = torch_npu.npu_moe_distribute_combine(**_kwargs)
+        hidden_states = torch_npu.npu_moe_distribute_combine_v2(**_kwargs)
         return hidden_states
