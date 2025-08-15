@@ -216,6 +216,7 @@ class ReplicatedLinear(LinearBase):
 
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
+            torch.npu.set_device(param.device)
             if param.size() != loaded_weight.size() and param.size(0) == 1:
                 if torch.allclose(loaded_weight, loaded_weight[0]):
                     loaded_weight = loaded_weight[:1]
@@ -378,6 +379,8 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -1259,6 +1262,8 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):

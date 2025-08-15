@@ -640,6 +640,8 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
+        if is_npu():
+            torch.npu.set_device(self.device)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
