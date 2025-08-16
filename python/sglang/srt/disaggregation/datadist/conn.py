@@ -186,17 +186,17 @@ class DataDistKVManager(CommonKVManager):
         llm_config.sync_kv_timeout = 20000
         rank_table, self.world_size = generate_rank_table_a3(self.device_id)
         llm_config.local_comm_res = rank_table
-        # 加上个node_rank偏移保证cluster_id不冲突
-        self.cluster_id = self.device_id + self.world_size * ServerArgs.node_rank
+        
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.cluster_id = (self.device_id + self.world_size * server_args.node_rank) * 2
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
             llm_config.listen_ip_info = (
                 f"{self.local_host_ip}:{26000 + self.kv_args.gpu_id}"
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.cluster_id = (self.device_id + self.world_size * server_args.node_rank) * 2 + 1
             self.role = LLMRole.DECODER
-            self.cluster_id += self.world_size * ServerArgs.nnodes
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -288,6 +288,8 @@ class DataDistKVManager(CommonKVManager):
                 return
             cluster_list = []
             for bootstrap_info in bootstrap_infos:
+                if bootstrap_info["is_dummy"]:
+                    continue
                 cluster = llm_datadist.LLMClusterInfo()
                 cluster.append_remote_ip_info(
                     bootstrap_info["rank_ip"], 26000 + bootstrap_info["gpu_id"]
