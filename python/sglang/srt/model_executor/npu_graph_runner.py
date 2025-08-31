@@ -114,17 +114,19 @@ class NpuGraphRunner(DeviceRunnerBase):
             )
 
         if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
             global_num_tokens = torch.tensor(
-                [
-                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                    for i in range(self.dp_size)
-                ],
+                [num_tokens] * self.dp_size,
                 dtype=torch.int64,
                 device=input_ids.device,
             )
         elif self.require_attn_tp_gather:
-            global_num_tokens = torch.tensor([num_tokens], dtype=torch.int64, device=input_ids.device)
+            global_num_tokens_cpu = [num_tokens]
+            global_num_tokens = torch.tensor(
+                [num_tokens], dtype=torch.int64, device=input_ids.device
+            )
         else:
+            global_num_tokens_cpu = None
             global_num_tokens = None
             gathered_buffer = None
 
@@ -159,8 +161,8 @@ class NpuGraphRunner(DeviceRunnerBase):
             global_forward_mode=None,
             mm_inputs=[None] * bs,
             lora_ids=[None] * bs,
-            global_num_tokens_cpu=[num_tokens],
-            global_num_tokens_for_logprob_cpu=[num_tokens],
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_cpu=global_num_tokens_cpu.copy(),
             global_num_tokens_for_logprob_gpu=global_num_tokens.clone(),
             can_run_graph=True,
         )
@@ -199,6 +201,21 @@ class NpuGraphRunner(DeviceRunnerBase):
             mark_tensor_static(forward_batch.token_to_kv_pool.v_buffer, is_cache=True)
         except AttributeError as e:
             mark_tensor_static(forward_batch.token_to_kv_pool.kv_buffer, is_cache=True)
+
+    def prepare_idle_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
+        forward_batch = self.prepare_forward_batch(bs, num_tokens)
+        forward_batch.batch_size = 0
+        forward_batch.forward_mode = ForwardMode.IDLE
+        with torch.device(self.model_runner.device):
+            forward_batch.input_ids = torch.empty(0, dtype=torch.int64)
+            forward_batch.seq_lens = torch.empty(0, dtype=torch.int64)
+            forward_batch.out_cache_loc = torch.empty(0, dtype=torch.int64)
+            forward_batch.req_pool_indices = torch.empty(0, dtype=torch.int32)
+            forward_batch.seq_lens_sum = 0
+        forward_batch.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self.model_runner)
+        return forward_batch
 
     def warm_up(self):
         if not self.enable_torch_compile:
@@ -244,6 +261,8 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                 )
             num_tokens = bs * self.num_tokens_per_bs
             forward_batch = self.prepare_forward_batch(bs, num_tokens)
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self.model_runner)
             forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
             if self.enable_cache:
@@ -292,6 +311,12 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                 torch.npu.synchronize()
                 self.model_runner.tp_group.barrier()
                 run_once()
+            if self.require_mlp_tp_gather:
+                for _ in range(2):
+                    torch.npu.synchronize()
+                    self.model_runner.tp_group.barrier()
+                    forward_batch = self.prepare_idle_batch(bs, num_tokens)
+                    run_once()
 
         return
 
@@ -317,14 +342,21 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                     **kwargs,
                 )
 
-        if not skip_attn_backend_init:
+        if (not skip_attn_backend_init) and forward_batch.forward_mode.is_decode():
             forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        graph_bs = forward_batch.batch_size
+        if self.require_mlp_tp_gather:
+            graph_bs = (
+                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else max(forward_batch.global_num_tokens_cpu)
+            )
         return bool(
-            forward_batch.forward_mode.is_decode()
+            forward_batch.forward_mode.is_decode_or_idle()
             and self.enable_torch_compile
-            and forward_batch.batch_size in self.compile_bs
+            and graph_bs in self.compile_bs
         )

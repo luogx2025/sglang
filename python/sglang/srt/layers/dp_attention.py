@@ -193,6 +193,22 @@ def disable_dp_size():
         _ATTN_DP_SIZE = old_dp_size
 
 
+def get_dp_local_info_npu(forward_batch: ForwardBatch):
+    dp_rank = get_attention_dp_rank()
+
+    if forward_batch.dp_local_start_pos is None:
+        if dp_rank == 0:
+            local_start_pos = 0
+        else:
+            local_start_pos = sum(forward_batch.global_num_tokens_cpu[0:dp_rank])
+        local_num_tokens = forward_batch.global_num_tokens_cpu[dp_rank]
+
+        forward_batch.dp_local_start_pos = local_start_pos
+        forward_batch.dp_local_num_tokens = local_num_tokens
+
+    return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
+
+
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
     dp_rank = get_attention_dp_rank()
@@ -276,8 +292,6 @@ def _dp_gather_via_all_reduce(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -287,6 +301,7 @@ def _dp_gather_via_all_reduce(
         and (is_partial or get_attention_tp_rank() == 0)
         and not is_npu()
     ):
+        local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
@@ -295,6 +310,7 @@ def _dp_gather_via_all_reduce(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
     elif is_npu():
+        local_start_pos, local_num_tokens = get_dp_local_info_npu(forward_batch)
         # npu not support memcpy_triton
         memcpy_npu(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -336,7 +352,7 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    if forward_batch.dp_padding_max_len:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -369,12 +385,11 @@ def dp_scatter(
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
-    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0 and not is_npu():
+        local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
@@ -383,6 +398,7 @@ def dp_scatter(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
     elif is_npu():
+        local_start_pos, local_num_tokens = get_dp_local_info_npu(forward_batch)
         memcpy_npu(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )

@@ -134,6 +134,8 @@ if _is_cuda:
         dsv3_router_gemm,
         merge_state_v2,
     )
+elif _is_npu:
+    import torch_npu
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
