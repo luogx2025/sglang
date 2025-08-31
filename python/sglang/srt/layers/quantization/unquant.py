@@ -19,11 +19,13 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
     from sglang.srt.layers.moe.topk import TopKOutput
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
@@ -32,12 +34,16 @@ has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _is_npu:
+    import torch_npu
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -102,8 +108,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        self.enable_weight_nz = _is_npu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.enable_weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data.transpose(-1, -2).contiguous(), 29
+            )  # 29: NZ format
+            layer.weight.input_dim = 0
+            layer.weight.output_dim = 1
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
@@ -115,11 +128,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            out = torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
-
-        return F.linear(x, layer.weight, bias)
+        elif _is_npu and self.enable_weight_nz:
+            origin_shape = x.size()
+            out = torch.matmul(x.view(-1, origin_shape[-1]), layer.weight.data)
+            if bias is not None:
+                out = out + bias
+            out = out.view((*origin_shape[:-1], -1))
+        else:
+            out = F.linear(x, layer.weight, bias)
+        return out
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -128,6 +148,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def __init__(self, use_triton_kernels: bool = False):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
+
+        self.triton_kernel_moe_forward = None
+        if torch.cuda.is_available() and has_triton_kernels:
+            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+                triton_kernel_moe_forward as _tk_forward,
+            )
+
+            self.triton_kernel_moe_forward = _tk_forward
 
     def create_weights(
         self,
@@ -194,6 +222,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+
         return self.forward(
             x=x,
             layer=layer,
@@ -219,16 +248,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
-            # TODO(ch-wan): re-enable the Triton kernel
-            raise NotImplementedError("The Triton kernel is temporarily disabled.")
-            # return triton_kernel_moe_forward(
-            #     hidden_states=x,
-            #     w1=layer.w13_weight,
-            #     w2=layer.w2_weight,
-            #     gating_output=router_logits,
-            #     topk=top_k,
-            #     renormalize=renormalize,
-            # )
+            return self.triton_kernel_moe_forward(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_output=topk_output,
+            )
         else:
             if _use_aiter:
                 assert not no_combine, "unsupported"
@@ -354,69 +379,3 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu
-
-
-class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts_per_partition: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts_per_partition,
-                2 * intermediate_size,
-                hidden_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts_per_partition,
-                hidden_size,
-                intermediate_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        # scale
-        layer.register_parameter("w13_input_scale", None)
-        layer.register_parameter("w13_weight_scale", None)
-
-        ones_tensor = torch.ones(num_experts_per_partition, dtype=torch.float32)
-
-        w2_input_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
-        set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-        w2_weight_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ) -> torch.Tensor:
-        raise NotImplementedError

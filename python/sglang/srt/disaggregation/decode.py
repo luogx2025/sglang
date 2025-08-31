@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -184,13 +185,19 @@ class DecodePreallocQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
-        attn_tp_size = self.tp_size // self.dp_size
+        attn_tp_size = get_attention_tp_size()
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+
         kv_args.decode_tp_size = attn_tp_size
+        # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
+        kv_args.pp_rank = 0
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.kv_data_shape = self.token_to_kv_pool.get_key_buffer(0).shape
+        kv_args.kv_data_dtype = self.token_to_kv_pool.get_key_buffer(0).dtype
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -208,6 +215,7 @@ class DecodePreallocQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.metadata_buffer_size = self.metadata_buffers.get_buffer_size()
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -694,10 +702,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -771,10 +776,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue

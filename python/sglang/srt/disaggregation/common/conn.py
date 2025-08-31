@@ -23,7 +23,14 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import (
+    format_tcp_address,
+    get_free_port,
+    get_ip,
+    get_local_ip_by_remote,
+    is_valid_ipv6_address,
+    maybe_wrap_ipv6_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +72,18 @@ class CommonKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
-            ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
+            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
+                if self.dist_init_addr.endswith("]"):
+                    host = self.dist_init_addr
+                else:
+                    host, _ = self.dist_init_addr.rsplit(":", 1)
+            else:
+                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
         else:
-            ip_address = get_ip()
+            host = get_ip()
+            host = maybe_wrap_ipv6_address(host)
 
-        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
+        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
         payload = {
             "role": "Prefill",
@@ -78,6 +92,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
+            "gpu_id": self.kv_args.gpu_id,
         }
 
         try:
@@ -92,8 +107,10 @@ class CommonKVManager(BaseKVManager):
             logger.error(f"Prefill Failed to register to bootstrap server: {e}")
 
     @cache
-    def _connect(self, endpoint: str):
+    def _connect(self, endpoint: str, is_ipv6: bool = False):
         socket = zmq.Context().socket(zmq.PUSH)
+        if is_ipv6:
+            socket.setsockopt(zmq.IPV6, 1)
         socket.connect(endpoint)
         return socket
 
@@ -263,14 +280,26 @@ class CommonKVReceiver(BaseKVReceiver):
             return None
 
     @classmethod
-    def _connect(cls, endpoint: str):
+    def _connect(cls, endpoint: str, is_ipv6: bool = False):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+                if is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
+        ip_address = bootstrap_info["rank_ip"]
+        port = bootstrap_info["rank_port"]
+        is_ipv6_address = is_valid_ipv6_address(ip_address)
+        sock, lock = cls._connect(
+            format_tcp_address(ip_address, port), is_ipv6=is_ipv6_address
+        )
+        return sock, lock
 
     def _register_kv_args(self):
         pass
@@ -320,7 +349,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
-
+        gpu_id = int(data["gpu_id"])
         if self.tp_size is None:
             self.tp_size = tp_size
 
@@ -343,6 +372,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.prefill_port_table[dp_group][tp_rank_in_dp_group] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
+                "gpu_id": gpu_id,
             }
             logger.debug(
                 f"Register Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"

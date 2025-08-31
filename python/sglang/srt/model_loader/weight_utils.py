@@ -37,7 +37,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.utils import print_warning_once, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +229,8 @@ def get_quant_config(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
+        elif model_config.quantization == "w8a8_int8":
+            config["packed_modules_mapping"] = packed_modules_mapping
 
     return quant_cls.from_config(config)
 
@@ -648,7 +650,8 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
-
+            if is_npu():
+                torch.npu.set_device(param.device)
             param.data.copy_(loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
@@ -840,6 +843,16 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 )
                 return None
             return remapped_name
+
+    quark_scale_names = {
+        ".q_proj.output_scale": ".attn.q_scale",
+        ".k_proj.output_scale": ".attn.k_scale",
+        ".v_proj.output_scale": ".attn.v_scale",
+        "self_attn.prob_output_scale": ".attn.prob_scale",
+    }
+    for quark_scale_name, sglang_scale_name in quark_scale_names.items():
+        if name.endswith(quark_scale_name):
+            return name.replace(quark_scale_name, sglang_scale_name)
 
     # If there were no matches, return the untouched param name
     return name

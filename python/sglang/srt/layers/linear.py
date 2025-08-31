@@ -13,9 +13,13 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -34,6 +38,12 @@ if TYPE_CHECKING:
         QuantizationConfig,
         QuantizeMethodBase,
     )
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +222,7 @@ class ReplicatedLinear(LinearBase):
 
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
+            torch.npu.set_device(param.device)
             if param.size() != loaded_weight.size() and param.size(0) == 1:
                 if torch.allclose(loaded_weight, loaded_weight[0]):
                     loaded_weight = loaded_weight[:1]
@@ -223,7 +234,6 @@ class ReplicatedLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
         output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -374,6 +384,8 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -1255,6 +1267,8 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1292,7 +1306,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            sm.tag(output_parallel)
         if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

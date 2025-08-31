@@ -31,7 +31,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -44,8 +43,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-if not _is_npu:
-    from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_per_layer_mla
+if _is_npu:
+    import torch_npu
 
 
 class ReqToTokenPool:
@@ -153,18 +152,6 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    @abc.abstractmethod
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        raise NotImplementedError()
-
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -253,7 +240,7 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
-        self.token_stride = self.head_num * self.head_dim
+
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer + self.v_buffer],
             dtype=torch.uint64,
@@ -347,47 +334,6 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
         torch.cuda.synchronize()
 
-    def load_from_host_per_layer(
-        self,
-        host_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
-    ):
-        transfer_kv_per_layer(
-            src_k=host_pool.k_buffer[layer_id],
-            dst_k=self.k_buffer[layer_id],
-            src_v=host_pool.v_buffer[layer_id],
-            dst_v=self.v_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
-            item_size=self.token_stride,
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        # todo: specialized all layer kernels for the layer-non-contiguous memory pool
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            if layer_id - self.start_layer >= len(host_pool.k_buffer):
-                raise ValueError(
-                    f"Layer ID {layer_id} exceeds the number of layers in host pool."
-                )
-            transfer_kv_per_layer(
-                src_k=self.k_buffer[layer_id],
-                dst_k=host_pool.k_buffer[layer_id],
-                src_v=self.v_buffer[layer_id],
-                dst_v=host_pool.v_buffer[layer_id],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
-                item_size=self.token_stride,
-            )
-
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -454,8 +400,20 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.k_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    self.v_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_v,
+                )
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         copy_all_layer_kv_cache[(len(self.data_ptrs),)](
@@ -602,16 +560,6 @@ class SWAKVPool(KVCache):
                 layer_id_override=layer_id_pool,
             )
 
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError("HiCache not supported for SWAKVPool.")
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        raise NotImplementedError("HiCache not supported for SWAKVPool.")
-
 
 class AscendTokenToKVPool(MHATokenToKVPool):
 
@@ -684,8 +632,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
-
-        import torch_npu
 
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
@@ -766,6 +712,16 @@ def set_mla_kv_buffer_triton(
     )
 
 
+def set_mla_kv_buffer_npu(
+    kv_buffer: torch.Tensor,
+    loc_tensor: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    key_states = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+    torch_npu.npu_scatter_nd_update_(kv_buffer, loc_tensor.view(-1, 1), key_states)
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -814,16 +770,25 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                if _is_npu:
+                    # NPU only support 128 align
+                    size_align = (size + page_size) // 128 * 128
+                else:
+                    size_align = size + page_size
                 self.kv_buffer = [
                     torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        (size_align, 1, kv_lora_rank + qk_rope_head_dim),
                         dtype=self.store_dtype,
                         device=device,
                     )
                     for _ in range(layer_num)
                 ]
 
-        self.token_stride = kv_lora_rank + qk_rope_head_dim
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
         self.layer_transfer_counter = None
 
         kv_size = self.get_kv_size_bytes()
@@ -888,7 +853,14 @@ class MLATokenToKVPool(KVCache):
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -905,40 +877,13 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope = cache_k_nope.view(self.store_dtype)
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
-        )
-
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        transfer_kv_per_layer_mla(
-            src=host_pool.kv_buffer[layer_id],
-            dst=self.kv_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
-            item_size=self.token_stride,
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        # todo: specialized all layer kernels for the layer-non-contiguous memory pool
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            if layer_id - self.start_layer >= len(host_pool.kv_buffer):
-                raise ValueError(
-                    f"Layer ID {layer_id} exceeds the number of layers in host pool."
-                )
-            transfer_kv_per_layer_mla(
-                src=self.kv_buffer[layer_id],
-                dst=host_pool.kv_buffer[layer_id],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
-                item_size=self.token_stride,
+        if _is_npu:
+            set_mla_kv_buffer_npu(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            )
+        else:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
             )
 
     def get_cpu_copy(self, indices):
@@ -1042,8 +987,6 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(store_dtype)
 
-        import torch_npu
-
         torch_npu._npu_reshape_and_cache_siso(
             key=cache_k.view(-1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
             key_cache=self.kv_buffer[layer_id - self.start_layer].view(
@@ -1130,20 +1073,6 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
         self.label_buffer[layer_id - self.start_layer][loc] = cache_label
-
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError(
-            "HiCache not supported for DoubleSparseTokenToKVPool."
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        raise NotImplementedError(
-            "HiCache not supported for DoubleSparseTokenToKVPool."
-        )
 
 
 @triton.jit

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
@@ -43,9 +44,9 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
-_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -58,12 +59,14 @@ if _is_npu:
     else:
         useMindIETurbo = True
 
+logger = logging.getLogger(__name__)
+
 
 # func refers to RMSNorm.__init__
 def npu_wrapper_rmsnorm_init(func):
     def init(self, hidden_size: int, **extra_args) -> None:
         func(self, hidden_size, **extra_args)
-        self.ignore_anti = True
+        self.has_bias = True
         # The Ascend w8a8_int8 quantization requires adding a bias in rmsnorm
         self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
 
@@ -185,7 +188,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.is_dynamic = (
+            quant_config.get("is_dynamic", False)
+            or quant_config.get("model_quant_type", "STATIC") == "W8A8_DYNAMIC"
+        )
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -194,6 +200,12 @@ class W8A8Int8Config(QuantizationConfig):
         )
 
         if _is_npu:
+            if self.is_dynamic:
+                return
+            else:
+                logger.info(
+                    f"Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models, the corresponding forword_npu function is called in w8a8_int8.py"
+                )
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
             for name in self.quant_description.keys():
                 if "norm.bias" in name:
@@ -231,7 +243,10 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
-        return []
+        filenames = []
+        if _is_npu:
+            filenames.append("quant_model_description.json")
+        return filenames
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
@@ -254,7 +269,11 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, self.packed_modules_mapping[proj_name][0]
                     )
                 self.is_dynamic = (
-                    self.quant_description[prefix_in_quant_config + ".weight"]
+                    "quant_method" in self.quant_description
+                    and self.quant_description["quant_method"] == "compressed-tensors"
+                ) or (
+                    f"{prefix_in_quant_config}.weight" in self.quant_description
+                    and self.quant_description[prefix_in_quant_config + ".weight"]
                     == "W8A8_DYNAMIC"
                 )
                 if self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -292,7 +311,8 @@ class W8A8Int8Config(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    f"{shard_prefix}.weight" in self.quant_description
+                    and self.quant_description[shard_prefix + ".weight"] == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -304,7 +324,10 @@ class W8A8Int8Config(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = (
+                f"{prefix}.weight" in self.quant_description
+                and self.quant_description[prefix + ".weight"] == "FLOAT"
+            )
 
         assert is_skipped is not None
         return is_skipped
@@ -315,8 +338,12 @@ class W8A8Int8Config(QuantizationConfig):
 
 class W8A8Int8LinearMethod(LinearMethodBase):
 
-    def __init__(self, quantization_config: W8A8Int8Config):
-        self.quantization_config = quantization_config
+    def __init__(self, quantization_config: W8A8Int8Config = None):
+        if quantization_config is None:
+            self.quantization_config = W8A8Int8Config()
+        else:
+            self.quantization_config = quantization_config
+        self.enable_weight_nz = _is_npu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
@@ -328,6 +355,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+        if self.enable_weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data.contiguous(), 29
+            )  # 29: NZ format
 
     def create_weights(
         self,
@@ -376,11 +407,27 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
 
-        x_q, x_scale = per_token_quant_int8(x)
-
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+        if _is_npu:
+            x_q, x_scale = torch_npu.npu_dynamic_quant(x)
+            out = torch_npu.npu_quant_matmul(
+                x_q,
+                layer.weight,
+                layer.weight_scale.view(-1),
+                pertoken_scale=x_scale.view(-1),
+                bias=bias,
+                output_dtype=x.dtype,
+            )
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out = int8_scaled_mm(
+                x_q,
+                layer.weight,
+                x_scale,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+        return out
 
 
 class W8A8Int8MoEMethod(FusedMoEMethodBase):
@@ -396,6 +443,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W8A8Int8Config):
         self.quant_config = quant_config
+        self.enable_weight_nz = _is_npu
 
     def create_weights(
         self,
@@ -459,14 +507,19 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
 
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        if self.enable_weight_nz:
+            layer.w13_weight = layer.w13_weight.npu()
+            layer.w2_weight = layer.w2_weight.npu()
+            layer.w13_weight.data = torch_npu.npu_format_cast(
+                layer.w13_weight.data, 29
+            )  # 29: NZ format
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
 
     def apply(
         self,
