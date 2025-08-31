@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
+from sglang.srt.utils import is_npu
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -104,6 +105,7 @@ class LogitsMetadata:
 
     # DP attention metadata. Not needed when DP attention is not used.
     # Number of tokens in the request.
+    global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # The start position of local hidden states.
     dp_local_start_pos: Optional[torch.Tensor] = None
@@ -112,10 +114,11 @@ class LogitsMetadata:
     # Buffer to gather logits from all ranks.
     forward_batch_gathered_buffer: Optional[torch.Tensor] = None
     # Number of tokens to sample per DP rank
-    global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DPPaddingMode] = None
+    dp_padding_max_len: bool = False
     # for padding
     padded_static_len: int = -1
 
@@ -161,6 +164,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
+            global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -172,19 +176,29 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
+        if not is_npu():
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            dp_rank = get_attention_dp_rank()
+            if dp_rank == 0:
+                dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                dp_local_start_pos = cumtokens[dp_rank - 1]
+            dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_attention_dp_rank()
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
-            )
+            self.dp_local_start_pos = dp_local_start_pos
+            self.dp_local_num_tokens = dp_local_num_tokens
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
-        dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+            dp_rank = get_attention_dp_rank()
+            if dp_rank == 0:
+                dp_local_start_pos = 0
+            else:
+                dp_local_start_pos = sum(self.global_num_tokens_for_logprob_cpu[0:dp_rank])
+            dp_local_num_tokens = self.global_num_tokens_for_logprob_cpu[dp_rank]
 
-        self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = dp_local_num_tokens
+            self.dp_local_start_pos = dp_local_start_pos
+            self.dp_local_num_tokens = dp_local_num_tokens
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage

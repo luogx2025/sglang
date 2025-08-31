@@ -272,6 +272,7 @@ class ForwardBatch:
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DPPaddingMode] = None
+    dp_padding_max_len: bool = True
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
@@ -298,6 +299,9 @@ class ForwardBatch:
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
+
+    # can run this batch in graph mode?
+    can_run_graph: bool = False
 
     @classmethod
     def init_new(
@@ -630,7 +634,7 @@ class ForwardBatch:
 
         dp_padding_mode = DPPaddingMode.get_dp_padding_mode(global_num_tokens)
         self.dp_padding_mode = dp_padding_mode
-
+        self.dp_padding_max_len = dp_padding_mode.is_max_len()
         if dp_padding_mode.is_max_len():
             # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
             # where transferred tokens should be padded to the same length.
@@ -683,6 +687,8 @@ class ForwardBatch:
         self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
             global_num_tokens
         )
+        self.global_num_tokens_for_logprob_cpu = global_num_tokens.copy()
+        self.global_num_tokens_for_logprob_gpu = self.global_num_tokens_gpu.clone()
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

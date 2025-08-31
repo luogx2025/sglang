@@ -39,6 +39,12 @@ if TYPE_CHECKING:
         QuantizeMethodBase,
     )
 
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+
 logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -228,7 +234,6 @@ class ReplicatedLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
         output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
